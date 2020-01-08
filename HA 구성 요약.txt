@@ -1,0 +1,491 @@
+1 HAProxy 서버 설치
+HAProxy yum install & Configuration (Only Kubelb)
+# HAProxy 설치
+[root@kubelb ~]# yum -y install haproxy
+
+# Disable SELINUX
+[root@kubelb ~]# sed -i 's/^SELINUX=enforcing$/SELINUX=disabled/' /etc/selinux/config
+[root@kubelb ~]# setenforce 0
+
+# Configu HAProxy.cnf
+[root@ kubelb HAProxy]# cat /etc/haproxy/haproxy.cfg
+#---------------------------------------------------------------------
+# Example configuration for a possible web application.  See the
+# full configuration options online.
+#
+#   http://haproxy.1wt.eu/download/1.4/doc/configuration.txt
+#
+#---------------------------------------------------------------------
+
+#---------------------------------------------------------------------
+# Global settings
+#---------------------------------------------------------------------
+global
+    # to have these messages end up in /var/log/haproxy.log you will
+    # need to:
+    #
+    # 1) configure syslog to accept network log events.  This is done
+    #    by adding the '-r' option to the SYSLOGD_OPTIONS in
+    #    /etc/sysconfig/syslog
+    #
+    # 2) configure local2 events to go to the /var/log/haproxy.log
+    #   file. A line like the following can be added to
+    #   /etc/sysconfig/syslog
+    #
+    #    local2.*                       /var/log/haproxy.log
+    #
+    log         127.0.0.1 local2
+
+    chroot      /var/lib/haproxy
+    pidfile     /var/run/haproxy.pid
+    maxconn     4000
+    user        haproxy
+    group       haproxy
+    daemon
+
+    # turn on stats unix socket
+    stats socket /var/lib/haproxy/stats
+
+#---------------------------------------------------------------------
+# common defaults that all the 'listen' and 'backend' sections will
+# use if not designated in their block
+#---------------------------------------------------------------------
+defaults
+    mode tcp
+    timeout connect 5000ms
+    timeout client 50000ms
+    timeout server 50000ms
+#---------------------------------------------------------------------
+# main frontend which proxys to the backends
+#---------------------------------------------------------------------
+frontend k8s-api-front
+#    bind 192.168.255.37:6443
+    bind *:6443
+    #option tcplog
+    default_backend k8s-api-back
+
+#---------------------------------------------------------------------
+# static backend for serving up images, stylesheets and such
+#---------------------------------------------------------------------
+
+#---------------------------------------------------------------------
+# round robin balancing between the various backends
+#---------------------------------------------------------------------
+backend k8s-api-back
+    #mode tcp
+    option tcplog
+    option tcp-check
+    balance roundrobin
+    default-server inter 10s downinter 5s rise 2 fall 2 slowstart 60s maxconn 250 maxqueue 256 weight 100
+    server kubemaster01 192.168.0.11:6443 check
+    server kubemaster02 192.168.0.12:6443 check
+    server kubemaster03 192.168.0.13:6443 check
+
+# HAProxy Restart
+[root@kubelb HAProxy]# systemctl enable haproxy
+[root@kubelb HAProxy]# systemctl restart haproxy
+
+# 확인
+[root@kubelb HAProxy]# netstat -anp|grep 6443
+tcp        0      0 0.0.0.0:6443            0.0.0.0:*               LISTEN      4350/haproxy
+
+
+------------------------------------------------------------------------------------------------------------------------
+
+#Docker cgroup 확인
+[root@kubemaster01 ~]# docker info|grep Cgroup
+Cgroup Driver: cgroupfs
+
+#Cgroup 변경 #이작업을 반드시 해야되는지 검색을 해보고 하길 바람
+[root@kubemaster01 ~]# vi /etc/docker/daemon.json
+{
+  "exec-opts": ["native.cgroupdriver=systemd"],
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "100m"
+  },
+  "storage-driver": "overlay2",
+  "storage-opts": [
+    "overlay2.override_kernel_check=true"
+  ]
+}
+
+#변경 적용
+[root@kubemaster01 ~]# systemctl daemon-reload
+[root@kubemaster01 ~]# systemctl restart docker
+
+#변경 확인
+[root@kubemaster01 ~]# docker info|grep Cgroup
+Cgroup Driver: systemd
+
+#문제 있을경우 삭제
+[root@kubemaster01 ~]# yum remove docker-ce
+[root@kubemaster01 ~]# rm -rf /var/lib/docker
+-------------------------------------------------------------------------------------------------------------------------
+5.5 환경 변수 설정
+# kubernetes version 확인
+# kubelet --version
+Kubernetes v1.16.2
+# kubeadm version
+kubeadm version: &version.Info{Major:"1", Minor:"16", GitVersion:"v1.16.2", GitCommit:"c97fe5036ef3df2967d086711e6c0c405941e14b", GitTreeState:"clean", BuildDate:"2019-10-15T19:15:39Z", GoVersion:"go1.12.10", Compiler:"gc", Platform:"linux/amd64"}
+
+# 참고한것 기본 설정인듯하다 이렇게 하니 성공 1.15버전 이상
+[root@kubemaster01 ~]# vi ./kubeadm-config.yaml
+apiVersion: kubeadm.k8s.io/v1beta1
+kind: ClusterConfiguration
+kubernetesVersion: 1.16.2
+controlPlaneEndpoint: "192.168.0.10:6443"
+networking:
+podSubnet: 10.244.0.0/16
+
+5.6 Kubeadm을 통한 초기화 (반드시 순서를 지켜서 할 것 kubemaster01~03)
+# 이것이 1.11 버전 1.15 이상은 적용하지않음
+#환경변수 작성
+export KUBERNETES_VER=v1.16.2
+export LOAD_BALANCER_DNS=192.168.255.34
+export LOAD_BALANCER_PORT=6443
+export CP1_HOSTNAME=kubemaster01
+export CP1_IP=192.168.255.38
+export CP2_HOSTNAME=kubemaster02
+export CP2_IP=192.168.255.39
+export CP3_HOSTNAME=kubemaster03
+export CP3_IP=192.168.255.40
+
+[root@kubemaster01 ~]# vi ./kubeadm-config.yaml
+apiVersion: kubeadm.k8s.io/v1alpha2
+kind: MasterConfiguration
+kubernetesVersion: ${KUBERNETES_VER}
+apiServerCertSANs:
+- "${LOAD_BALANCER_DNS}"
+api:
+    controlPlaneEndpoint: "$LOAD_BALANCER_DNS:$LOAD_BALANCER_PORT"
+etcd:
+  local:
+    extraArgs:
+      listen-client-urls: "https://127.0.0.1:2379,https://${CP1_IP}:2379"
+      advertise-client-urls: "https://${CP1_IP}:2379"
+      listen-peer-urls: "https://${CP1_IP}:2380"
+      initial-advertise-peer-urls: "https://${CP1_IP}:2380"
+      initial-cluster: "${CP1_HOSTNAME}=https://${CP1_IP}:2380"
+    serverCertSANs:
+      - $CP1_HOSTNAME
+      - $CP1_IP
+    peerCertSANs:
+      - $CP1_HOSTNAME
+      - $CP1_IP
+networking:
+    # This CIDR is a Flannel default. Substitute or remove for your CNI provider.
+    podSubnet: "10.244.0.0/16"
+
+
+# ipv4 포워딩 활성화
+# echo 1 > /proc/sys/net/ipv4/ip_forward
+
+# 초기화 실행 1.15 이상 버전 아래와 같이 실행
+# kubeadm init --config=./kubeadm-config.yaml --upload-certs
+Your Kubernetes control-plane has initialized successfully!
+
+To start using your cluster, you need to run the following as a regular user:
+
+  mkdir -p $HOME/.kube
+  sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+  sudo chown $(id -u):$(id -g) $HOME/.kube/config
+
+You should now deploy a pod network to the cluster.
+Run "kubectl apply -f [podnetwork].yaml" with one of the options listed at:
+  https://kubernetes.io/docs/concepts/cluster-administration/addons/
+
+You can now join any number of the control-plane node running the following command on each as root:
+
+  kubeadm join 192.168.0.10:6443 --token rfthql.q908317x2pfz9jn3 \
+    --discovery-token-ca-cert-hash sha256:0958f00d84b5bed5ca88e71e99dea5a845eba2e88851d5c8000c59c8241b6776 \
+    --control-plane --certificate-key 5a2ce911805091e624e1df3caca9f752de4824ae6293fa9e9597f8917a3273be
+
+Please note that the certificate-key gives access to cluster sensitive data, keep it secret!
+As a safeguard, uploaded-certs will be deleted in two hours; If necessary, you can use
+"kubeadm init phase upload-certs --upload-certs" to reload certs afterward.
+
+Then you can join any number of worker nodes by running the following on each as root:
+
+kubeadm join 192.168.0.10:6443 --token rfthql.q908317x2pfz9jn3 \
+    --discovery-token-ca-cert-hash sha256:0958f00d84b5bed5ca88e71e99dea5a845eba2e88851d5c8000c59c8241b6776 [root@kubemaster01 ~]#
+[root@kubemaster01 ~]# mkdir -p $HOME/.kube
+[root@kubemaster01 ~]# sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+[root@kubemaster01 ~]# sudo chown $(id -u):$(id -g) $HOME/.kube/config
+
+# CNI 설치
+[root@kubemaster01 ~]# wget https://raw.githubusercontent.com/coreos/flannel/2140ac876ef134e0ed5af15c65e414cf26827915/Documentation/kube-flannel.yml
+[root@kubemaster01 ~]# kubectl apply -f kube-flannel.yml
+
+#노드확인
+[root@kubemaster01 ~]# kubectl get nodes
+NAME           STATUS   ROLES    AGE     VERSION
+kubemaster01   Ready    master   8m21s   v1.16.2
+[root@kubemaster01 ~]#
+
+#kubemaster02 에서 실행
+[root@kubemaster02 ~]# kubeadm join 192.168.0.10:6443 --token rfthql.q908317x2pfz9jn3 --discovery-token-ca-cert-hash sha256:0958f00d84b5bed5ca88e71e99dea5a845eba2e88851d5c8000c59c8241b6776 --control-plane --certificate-key 5a2ce911805091e624e1df3caca9f752de4824ae6293fa9e9597f8917a3273be
+[root@kubemaster02 ~]# mkdir -p $HOME/.kube
+[root@kubemaster02 ~]# sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+[root@kubemaster02 ~]# sudo chown $(id -u):$(id -g) $HOME/.kube/config
+
+#kubemaster03 에서 실행
+[root@kubemaster03 ~]# kubeadm join 192.168.255.34:6443 --token s00xr5.duti4gieqhqlzyhv --discovery-token-ca-cert-hash sha256:2211f70a4a4b4760418d7db2ad00e2886044cef97b16dd4b1ac14ffaac642df1 --control-plane --certificate-key c900aa808f93be6ba573718f489e9fdd91b372cc4cd982c71509b8e16a9b181d
+[root@kubemaster03 ~]# mkdir -p $HOME/.kube
+[root@kubemaster03 ~]# sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+[root@kubemaster03 ~]# sudo chown $(id -u):$(id -g) $HOME/.kube/config
+
+#완료후 노드확인
+[root@kubemaster01 ~]# kubectl get nodes
+NAME           STATUS     ROLES    AGE     VERSION
+kubemaster01   Ready   master   5m17s   v1.16.2
+kubemaster02   Ready   master   3m23s   v1.16.2
+kubemaster03   Ready   master   1m10s   v1.16.2
+[root@kubemaster01 ~]#
+
+#실패시
+$ kubeadm reset
+$ systemctl stop kubelet
+$ systemctl stop docker
+$ rm -rf /var/lib/cni/
+$ rm -rf /var/lib/kubelet/*
+$ rm -rf /etc/cni/
+$ /sbin/ifconfig cni0 down
+$ /sbin/ifconfig flannel.1 down
+$ /sbin/ifconfig docker0 down
+$ /sbin/ip link delete cni0
+$ /sbin/ip link delete flannel.1
+$ systemctl start docker
+$ systemctl start kubelet
+
+다시 재구축 진행
+-------------------------------------------------------------------------------------------------------------------------------------------
+
+7 Docker Docker-Distribution Local Repository
+7.1 Docker-distribution 설치 및 보안 레지스트리 구성 (On KubeLB)
+# Docker-distribution 설치
+[root@kubelb ~]# yum install -y docker-distribution
+
+# Docker-distribution 보안 레지스트리 구성 SSL/TLS 인증서 작성
+[root@kubelb ~]# openssl req -newkey rsa:2048 -nodes -sha256 -x509 -days 365 -keyout /etc/pki/tls/private/registry.key -out /etc/pki/tls/registry.crt
+Country Name (2 letter code) [XX]:
+State or Province Name (full name) []:
+Locality Name (eg, city) [Default City]:
+Organization Name (eg, company) [Default Company Ltd]:
+Organizational Unit Name (eg, section) []:
+Common Name (eg, your name or your server's hostname) []:kubelb [여긴 반드시 입력해야되며 IP로 하면 안된다]
+Email Address []: Email Address []:
+[root@kubelb ~]# 
+
+7.2 익명사용자가 Local Registry 접근을 막기 위한 http 설정 (On KubeLB)
+# Http-tools 설치
+[root@kubelb ~]# yum install -y httpd-tools
+
+#접근 계정 생성
+[root@kubelb ~]# htpasswd -c -B /etc/docker-distribution/dockerpasswd admin
+New password:
+Re-type new password:
+Adding password for user admin
+[root@kubelb ~]#
+
+#Docker Registry 구성 파일 편집
+[root@kubelb ~]# vi /etc/docker-distribution/registry/config.yml
+version: 0.1
+log:
+  fields:
+    service: registry
+storage:
+    cache:
+        layerinfo: inmemory
+    filesystem:
+        rootdirectory: /var/lib/registry
+http:
+    addr: kubelb:5000
+    tls:
+        certificate: /etc/pki/tls/registry.crt
+        key: /etc/pki/tls/private/registry.key
+auth:
+    htpasswd:
+        realm: example.com
+        path: /etc/docker-distribution/dockerpasswd
+
+# 서비스 활성화 및 기동
+[root@kubelb ~]# systemctl enable docker-distribution
+[root@kubelb ~]# systemctl start docker-distribution
+
+7.3 방화벽 설정 (On KubeLB)
+# Iptables 나 Firewalld 를 사용안하면 딱히 하지 안아도 된다.
+[root@kubelb ~]# firewall-cmd --permanent --add-port=5000/tcp
+[root@kubelb ~]# firewall-cmd --reload
+
+
+7.4 Docker 호스트에 Secured Docker Regitry 등록 (Kubemaster01~03 Kuberworkd01~02)
+# 위에서 인증서 생성시 common name을 도메인으로 한경우 아래 와같이 hosts에 박아놓은다 그렇지 않으면 패스
+# cat >> /etc/hosts << EOF
+> 192.168.0.10 kubelb
+> EOF
+
+7.5 Docker 호스트에 TLS/SSL 인증서 설치 (Kubemaster01~03 Kubeworker01~02)
+# 디렉토리 생성후 인증서 복사 인증서가 없으면 이미지 풀링이 안된다.
+# mkdir -p /etc/docker/certs.d/kubelb:5000
+# scp root@192.168.0.10:/etc/pki/tls/registry.crt /etc/docker/certs.d/kubelb\:5000/
+The authenticity of host '192.168.0.10 (192.168.0.10)' can't be established.
+root@192.168.0.10's password:
+registry.crt                                                                                                                                                                 100% 1261     1.4MB/s   00:00
+#
+
+7.6 DockerHub 에서 이미지 가져와서 테그 붙이기 (아무 호스트 테스트)
+# 디렉토리 생성후 인증서 복사
+# docker pull alpine
+Using default tag: latest
+latest: Pulling from library/alpine
+8e402f1a9c57: Pull complete
+Digest: sha256:644fcb1a676b5165371437feaa922943aaf7afcfa8bfee4472f6860aad1ef2a0
+Status: Downloaded newer image for alpine:latest
+
+# docker tag alpine kubelb:5000/alpine
+
+7.7 Local Registry 로그인 및 푸시
+# 이미지 푸시를 위해 로컬 레지스트리 로그인
+# docker login kubelb:5000
+Username: admin
+Password:admin
+WARNING! Your password will be stored unencrypted in /root/.docker/config.json.
+Configure a credential helper to remove this warning. See
+https://docs.docker.com/engine/reference/commandline/login/#credentials-store
+
+Login Succeeded
+
+만약 아래와 같은 에러가 나오면 인증서 관련 문제 이니 인증서 복사가 잘되었나 확인
+Error response from daemon: Get https://kubelb:5000/v2/: x509: certificate signed by unknown authority
+
+# docker push kubelb:5000/alpine
+The push refers to repository [kubelb:5000/alpine]
+bcf2f368fe23: Pushed
+latest: digest: sha256:d05ecd4520cab5d9e5d877595fb0532aadcd6c90f4bbc837bc11679f704c4c82 size: 528
+
+8 Kubernetes Docker-Distribution Local Repository Create Secret
+8.1 Docker Reposity 간 Secret 생성 방법1 도커 로그인 정보 이용 (On KubeMaster01)
+#해당 방법은 기존 Docker를 로그인한 정보를 바탕으로 Secret 을 만드는 것이다.
+# Kubernetes Secret 생성 .docker 폴더가 없다면 docker login 을 한번도 하지 안았기 때문 이다 수동으로 docker login 하여 로그인을 하면 생성됨
+[root@kubemaster01 ~]# kubectl create secret generic regcred --from-file=.dockerconfigjson=/root/.docker/config.json --type=kubernetes.io/dockerconfigjson
+secret/regcred created
+[root@kubemaster01 ~]#
+
+#config.json 파일에는 아래와 같은 정보가 들어 있다
+cat config.json
+{
+        "auths": {
+                "kubelb:5000": {
+                        "auth": "YWRtaW46YWRtaW4="
+                }
+        },
+        "HttpHeaders": {
+                "User-Agent": "Docker-Client/19.03.4 (linux)"
+        }
+}
+
+8.2 Docker Reposity 간 Secret 생성 방법2 명령어 생성 (On KubeMaster01)
+#해당 방법은 명령어를 이용하여 직접 Secret을 만드는 것이다.
+#명령어 참고 kubectl create secret docker-registry regcred --docker-server=<your-registry-server> --docker-username=<your-name> --docker-password=<your-pword> --docker-email=<your-email>
+
+#생성 email은 안넣어도 된다.
+[root@kubemaster01 ~]# kubectl create secret docker-registry regcred-cli --docker-server=https://kubelb:5000 --docker-username=admin --docker-password=admin
+secret/regcred-cli created
+[root@kubemaster01 ~]# kubectl get secret
+NAME                  TYPE                                  DATA   AGE
+default-token-k4r76   kubernetes.io/service-account-token   3      6d23h
+regcred               kubernetes.io/dockerconfigjson       1      14m
+regcred-cli           kubernetes.io/dockerconfigjson        1      6s
+[root@kubemaster01 ~]#
+
+8.3 생성된 Secret 정보 확인(On KubeMaster01)
+#생성된 정보를 디코딩하여 보여준다.
+[root@kubemaster01 ~]# kubectl get secret regcred-cli --output="jsonpath={.data.\.dockerconfigjson}" | base64 --decode
+{"auths":{"https://kubelb:5000":{"username":"admin","password":"admin","auth":"YWRtaW46YWRtaW4="}}}
+[root@kubemaster01 ~]#
+
+8.4 실제 Docker Local Repository 에서 Pulling 하여 PoD 생성 테스트 (On KubeMaster01)
+#pod yaml 파일 작성
+[root@kubemaster01 ~]# vi testapachepod.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-apache
+spec:
+  containers:
+  - name: test-apache
+    image: kubelb:5000/apacheload:0.1
+  imagePullSecrets:
+- name: regcred-cli
+
+#생성
+[root@kubemaster01 ~]# kubectl apply -f testapachepod.yaml
+pod/private-reg created
+
+#확인
+[root@kubemaster01 ~]# kubectl get pods
+NAME          READY   STATUS              RESTARTS   AGE
+test-apache   0/1     ContainerCreating   0          9s
+[root@kubemaster01 ~]# kubectl get pods
+NAME          READY   STATUS    RESTARTS   AGE
+test-apache   1/1     Running   0          10s
+[root@kubemaster01 ~]# kubectl describe pods test-apache
+Name:         test-apache
+Namespace:    default
+Priority:     0
+Node:         kubeworker02/192.168.0.15
+Start Time:   Wed, 13 Nov 2019 14:27:39 +0900
+Labels:       <none>
+Annotations:  kubectl.kubernetes.io/last-applied-configuration:
+                {"apiVersion":"v1","kind":"Pod","metadata":{"annotations":{},"name":"test-apache","namespace":"default"},"spec":{"containers":[{"image":"k...
+Status:       Running
+IP:           10.244.4.31
+IPs:
+  IP:  10.244.4.31
+Containers:
+  test-apache:
+    Container ID:   docker://64e84179fedcfac6d09968cd3da38e7298ebac68736da739054a4837d7b04b9f
+    Image:          kubelb:5000/apacheload:0.1
+    Image ID:       docker-pullable://kubelb:5000/apacheload@sha256:86bb7e6d0bccc7e618cd82bc5c3a8f7b98e572a4fecb34dfe66a5b6876b32c52
+    Port:           <none>
+    Host Port:      <none>
+    State:          Running
+      Started:      Wed, 13 Nov 2019 14:27:49 +0900
+    Ready:          True
+    Restart Count:  0
+    Environment:    <none>
+    Mounts:
+      /var/run/secrets/kubernetes.io/serviceaccount from default-token-k4r76 (ro)
+Conditions:
+  Type              Status
+  Initialized       True
+  Ready             True
+  ContainersReady   True
+  PodScheduled      True
+Volumes:
+  default-token-k4r76:
+    Type:        Secret (a volume populated by a Secret)
+    SecretName:  default-token-k4r76
+    Optional:    false
+QoS Class:       BestEffort
+Node-Selectors:  <none>
+Tolerations:     node.kubernetes.io/not-ready:NoExecute for 300s
+                 node.kubernetes.io/unreachable:NoExecute for 300s
+Events:
+  Type    Reason     Age        From                   Message
+  ----    ------     ----       ----                   -------
+  Normal  Scheduled  <unknown>  default-scheduler      Successfully assigned default/test-apache to kubeworker02
+  Normal  Pulling    24s        kubelet, kubeworker02  Pulling image "kubelb:5000/apacheload:0.1"
+  Normal  Pulled     16s        kubelet, kubeworker02  Successfully pulled image "kubelb:5000/apacheload:0.1"
+  Normal  Created    15s        kubelet, kubeworker02  Created container test-apache
+  Normal  Started    15s        kubelet, kubeworker02  Started container test-apache
+[root@kubemaster01 ~]#
+
+
+
+-------------------------------------------------------------------------------------------------------------------------
+
+
+
+
